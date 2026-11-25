@@ -12,8 +12,9 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # Collect every .cpp under src/ (new files are picked up when you re-run CMake)
 file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
+file(GLOB_RECURSE APP_HEADERS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/include/*.h)
 
-add_executable(BackupVault ${APP_SOURCES})
+add_executable(BackupVault ${APP_SOURCES} ${APP_HEADERS})
 target_link_libraries(BackupVault PRIVATE Qt6::Widgets Qt6::Sql)
 
 # ---- Tests (each tests/test_*.cpp becomes its own executable) ----
@@ -24,7 +25,7 @@ set(LIB_SOURCES ${APP_SOURCES})
 list(FILTER LIB_SOURCES EXCLUDE REGEX ".*/src/main\\.cpp$")
 foreach(test_src ${TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
-    add_executable(${test_name} ${test_src} ${LIB_SOURCES})
+    add_executable(${test_name} ${test_src} ${LIB_SOURCES} ${APP_HEADERS})
     target_link_libraries(${test_name} PRIVATE Qt6::Widgets Qt6::Sql)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
