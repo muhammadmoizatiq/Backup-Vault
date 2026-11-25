@@ -1,13 +1,14 @@
 #include <QApplication>
-#include <QLabel>
+#include "gui/FileSelectionWidget.h"
 
-// Placeholder entry point. Moiz replaces this with gui/MainWindow.
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
-    QLabel label("BackupVault");
-    label.resize(320, 120);
-    label.setAlignment(Qt::AlignCenter);
-    label.show();
+
+    bv::FileSelectionWidget widget;
+    widget.resize(700, 400);
+    widget.setWindowTitle("BackupVault - File Selection");
+    widget.show();
+
     return app.exec();
 }
