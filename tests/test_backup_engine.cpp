@@ -12,6 +12,7 @@
 #include <QUuid>
 
 #include <iostream>
+#include <thread>
 
 using namespace bv;
 
@@ -521,6 +522,257 @@ void testTransactionRollback()
           "Physical chunk is retained safely after rollback");
 }
 
+
+void testMultipleFileAndFolderSelectionWithProgress()
+{
+    QTemporaryDir temp;
+    if (!temp.isValid()) {
+        check(false, "Multiple-source temporary directory");
+        return;
+    }
+
+    const QString folder = temp.filePath("picked-folder");
+    const QString nested = folder + "/nested";
+    const QString vault = temp.filePath("vault");
+    const QString looseFile = temp.filePath("loose.txt");
+
+    if (!makeDirectory(nested) ||
+        !makeDirectory(folder + "/empty-dir") ||
+        !writeFile(nested + "/inside.txt", QByteArray("inside-data")) ||
+        !writeFile(looseFile, QByteArray("loose-data"))) {
+        check(false, "Create multiple-source fixtures");
+        return;
+    }
+
+    DatabaseManager database(vault);
+    if (!database.open().isOk()) {
+        check(false, "Open database for multiple-source test");
+        return;
+    }
+
+    ChunkStorage storage(vault);
+    ChunkIndex index(database);
+    BackupEngine engine(vault, database, storage, index);
+
+    BackupRequest request;
+    request.sourcePaths = {folder, looseFile};
+    request.snapshotName = "Multiple selections";
+
+    std::vector<BackupProgress> updates;
+    auto result = engine.createBackup(
+        request,
+        [&](const BackupProgress &value) { updates.push_back(value); }
+    );
+
+    check(result.isOk(), "Back up selected folder and individual file");
+    if (!result.isOk()) {
+        std::cout << "Multiple-source error: "
+                  << result.message().toStdString() << '\n';
+        return;
+    }
+
+    const BackupSummary &summary = result.value();
+    check(summary.filesBackedUp == 2,
+          "Multiple-source backup records both files");
+    check(summary.directoriesBackedUp == 4,
+          "Multiple-source backup records synthetic root, selected folder and two subdirectories");
+    check(summary.originalBytes == 21,
+          "Multiple-source backup reports total source bytes");
+
+    const QString dbPath = database.databasePath();
+    check(scalar(dbPath,
+                 "SELECT COUNT(*) FROM files WHERE relative_path = 'picked-folder/nested/inside.txt'")
+              .toInt() == 1,
+          "Selected folder contents are stored under its base name");
+    check(scalar(dbPath,
+                 "SELECT COUNT(*) FROM files WHERE relative_path = 'loose.txt'")
+              .toInt() == 1,
+          "Selected individual file is stored under its base name");
+    check(scalar(dbPath,
+                 "SELECT COUNT(*) FROM files WHERE relative_path = 'picked-folder/empty-dir' "
+                 "AND entry_type = 'directory'")
+              .toInt() == 1,
+          "Empty selected subdirectory is preserved");
+
+    check(!updates.empty(), "Progress callback receives updates");
+    if (!updates.empty()) {
+        const BackupProgress &last = updates.back();
+        check(last.filesCompleted == 2,
+              "Progress reports completed file count");
+        check(last.totalFiles == 2,
+              "Progress reports total file count");
+        check(last.bytesProcessed == 21 && last.totalBytes == 21,
+              "Progress reports processed and total bytes");
+    }
+}
+
+void testMultipleSourceCollisionsRejected()
+{
+    QTemporaryDir temp;
+    if (!temp.isValid()) {
+        check(false, "Source-collision temporary directory");
+        return;
+    }
+
+    const QString first = temp.filePath("one/same.txt");
+    const QString second = temp.filePath("two/SAME.txt");
+    const QString vault = temp.filePath("vault");
+    makeDirectory(QFileInfo(first).absolutePath());
+    makeDirectory(QFileInfo(second).absolutePath());
+    writeFile(first, QByteArray("one"));
+    writeFile(second, QByteArray("two"));
+
+    DatabaseManager database(vault);
+    if (!database.open().isOk()) {
+        check(false, "Open database for source-collision test");
+        return;
+    }
+    ChunkStorage storage(vault);
+    ChunkIndex index(database);
+    BackupEngine engine(vault, database, storage, index);
+
+    BackupRequest request;
+    request.sourcePaths = {first, second};
+    request.snapshotName = "Colliding selections";
+    auto result = engine.createBackup(request);
+
+    check(!result.isOk(), "Reject selected sources with colliding base names");
+    check(scalar(database.databasePath(),
+                 "SELECT COUNT(*) FROM snapshots").toInt() == 0,
+          "Colliding selections create no snapshot");
+
+    const QString parent = temp.filePath("overlap");
+    const QString child = parent + "/inside.txt";
+    makeDirectory(parent);
+    writeFile(child, QByteArray("nested"));
+    request.sourcePaths = {parent, child};
+    request.snapshotName = "Overlapping selections";
+    auto overlapResult = engine.createBackup(request);
+    check(!overlapResult.isOk(),
+          "Reject a selected source nested inside another selected folder");
+
+    request.sourcePaths = {first};
+    request.snapshotName = "   ";
+    auto emptyNameResult = engine.createBackup(request);
+    check(!emptyNameResult.isOk(),
+          "Reject an empty or whitespace-only snapshot name");
+    check(scalar(database.databasePath(),
+                 "SELECT COUNT(*) FROM snapshots").toInt() == 0,
+          "Invalid selection and snapshot name create no snapshot");
+}
+
+void testEngineRejectsCrossThreadUse()
+{
+    QTemporaryDir temp;
+    if (!temp.isValid()) {
+        check(false, "Thread-affinity temporary directory");
+        return;
+    }
+    const QString source = temp.filePath("source");
+    const QString vault = temp.filePath("vault");
+    makeDirectory(source);
+    writeFile(source + "/data.txt", QByteArray("thread"));
+
+    DatabaseManager database(vault);
+    if (!database.open().isOk()) {
+        check(false, "Open database for thread-affinity test");
+        return;
+    }
+    ChunkStorage storage(vault);
+    ChunkIndex index(database);
+    BackupEngine engine(vault, database, storage, index);
+
+    BackupRequest request;
+    request.sourcePath = source;
+    request.snapshotName = "Wrong thread";
+
+    bool succeededOnWrongThread = true;
+    bool databaseReportedOpenOnWrongThread = true;
+    bool databaseOpenedOnWrongThread = true;
+    QString error;
+    std::thread worker([&]() {
+        auto result = engine.createBackup(request);
+        succeededOnWrongThread = result.isOk();
+        if (!result.isOk())
+            error = result.message();
+        databaseReportedOpenOnWrongThread = database.isOpen();
+        databaseOpenedOnWrongThread = database.open().isOk();
+    });
+    worker.join();
+
+    check(!succeededOnWrongThread,
+          "Reject BackupEngine use from a different thread");
+    check(error.contains("constructed"),
+          "Cross-thread rejection explains worker construction requirement");
+    check(!databaseReportedOpenOnWrongThread &&
+          !databaseOpenedOnWrongThread,
+          "DatabaseManager rejects cross-thread access and opening");
+}
+
+
+void testRollbackPreservesPreviouslyReferencedChunks()
+{
+    QTemporaryDir temp;
+    if (!temp.isValid()) {
+        check(false, "Shared-chunk rollback temporary directory");
+        return;
+    }
+
+    const QString source = temp.filePath("source");
+    const QString vault = temp.filePath("vault");
+    const QByteArray contents("shared immutable chunk");
+    makeDirectory(source);
+    writeFile(source + "/data.bin", contents);
+
+    DatabaseManager database(vault);
+    if (!database.open().isOk()) {
+        check(false, "Open database for shared-chunk rollback test");
+        return;
+    }
+
+    ChunkStorage storage(vault);
+    ChunkIndex index(database);
+    BackupEngine engine(vault, database, storage, index);
+
+    BackupRequest initial;
+    initial.sourcePath = source;
+    initial.snapshotName = "Initial complete snapshot";
+    auto initialResult = engine.createBackup(initial);
+    check(initialResult.isOk(), "Create initial snapshot referencing chunk");
+    if (!initialResult.isOk())
+        return;
+
+    const QString expectedHash = hashOf(contents);
+    check(storage.exists(expectedHash),
+          "Shared chunk exists after initial snapshot");
+
+    const bool triggerCreated = executeSql(
+        database.databasePath(),
+        "CREATE TRIGGER reject_shared_test_chunk_link "
+        "BEFORE INSERT ON file_chunks "
+        "BEGIN SELECT RAISE(ABORT, 'forced shared rollback'); END"
+    );
+    check(triggerCreated, "Install shared-chunk rollback trigger");
+    if (!triggerCreated)
+        return;
+
+    BackupRequest failed;
+    failed.sourcePath = source;
+    failed.snapshotName = "Failed second snapshot";
+    auto failedResult = engine.createBackup(failed);
+    check(!failedResult.isOk(), "Second backup fails and rolls back");
+
+    check(scalar(database.databasePath(),
+                 "SELECT COUNT(*) FROM snapshots").toInt() == 1,
+          "Failed second backup leaves original snapshot intact");
+    check(scalar(database.databasePath(),
+                 "SELECT ref_count FROM chunks WHERE hash = '" +
+                     expectedHash + "'").toInt() == 1,
+          "Rollback preserves existing chunk reference count");
+    check(storage.load(expectedHash).isOk(),
+          "Rollback preserves the physical chunk used by the first snapshot");
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -533,6 +785,10 @@ int main(int argc, char *argv[])
     testSourceSymlinkRejected();
     testUnreadableSubdirectoryRejected();
     testTransactionRollback();
+    testMultipleFileAndFolderSelectionWithProgress();
+    testMultipleSourceCollisionsRejected();
+    testEngineRejectsCrossThreadUse();
+    testRollbackPreservesPreviouslyReferencedChunks();
 
     std::cout << "\n========== BACKUP ENGINE TEST SUMMARY ==========\n";
     std::cout << "Passed: " << passed << '\n';
