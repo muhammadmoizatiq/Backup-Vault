@@ -1,6 +1,8 @@
+
 #include "core/BackupEngine.h"
 
 #include "core/Chunker.h"
+
 #include <QByteArrayView>
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -10,6 +12,7 @@
 #include <QLockFile>
 
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace bv {
@@ -18,7 +21,11 @@ namespace {
 
 QString normalizedPath(const QString &path)
 {
-    return QDir::cleanPath(QFileInfo(path).canonicalFilePath());
+    const QString canonical = QFileInfo(path).canonicalFilePath();
+    if (canonical.isEmpty())
+        return QString();
+
+    return QDir::cleanPath(canonical);
 }
 
 bool isSameOrInside(const QString &path, const QString &parent)
@@ -46,7 +53,8 @@ QString relativePathFor(const QString &root, const QString &path)
         return QStringLiteral(".");
 
     QString relative = QDir(root).relativeFilePath(path);
-    return QDir::fromNativeSeparators(QDir::cleanPath(relative));
+    relative = QDir::fromNativeSeparators(relative);
+    return QDir::cleanPath(relative);
 }
 
 QString sha256Hex(const QByteArray &digest)
@@ -71,7 +79,8 @@ BackupEngine::BackupEngine(
 
 Result<BackupSummary> BackupEngine::createBackup(
     const BackupRequest &request
-) {
+)
+{
     if (!m_database.isOpen()) {
         return Result<BackupSummary>::failure(
             "Database must be open before creating a backup."
@@ -84,7 +93,14 @@ Result<BackupSummary> BackupEngine::createBackup(
         );
     }
 
-    // Ensure the vault directory exists before creating its lock.
+    // Reject a vault path that is itself a symbolic link.
+    QFileInfo vaultInputInfo(m_vaultRoot);
+    if (vaultInputInfo.isSymLink()) {
+        return Result<BackupSummary>::failure(
+            "The vault directory cannot be a symbolic link."
+        );
+    }
+
     if (!QDir().mkpath(m_vaultRoot)) {
         return Result<BackupSummary>::failure(
             "Cannot create vault directory: " + m_vaultRoot
@@ -92,6 +108,25 @@ Result<BackupSummary> BackupEngine::createBackup(
     }
 
     const QString vaultCanonical = normalizedPath(m_vaultRoot);
+
+    // Check the original source path before canonicalization. Otherwise,
+    // canonicalFilePath() would hide a source path that is a symlink.
+    QFileInfo sourceInputInfo(request.sourcePath);
+
+    if (sourceInputInfo.isSymLink()) {
+        return Result<BackupSummary>::failure(
+            "The source folder cannot be a symbolic link."
+        );
+    }
+
+    if (!sourceInputInfo.exists() ||
+        !sourceInputInfo.isDir() ||
+        !sourceInputInfo.isReadable()) {
+        return Result<BackupSummary>::failure(
+            "Source must be an existing readable directory."
+        );
+    }
+
     const QString sourceCanonical = normalizedPath(request.sourcePath);
 
     if (vaultCanonical.isEmpty() || sourceCanonical.isEmpty()) {
@@ -100,23 +135,14 @@ Result<BackupSummary> BackupEngine::createBackup(
         );
     }
 
-    QFileInfo sourceInfo(sourceCanonical);
-
-    if (!sourceInfo.exists() || !sourceInfo.isDir() ||
-        !sourceInfo.isReadable()) {
-        return Result<BackupSummary>::failure(
-            "Source must be an existing readable directory."
-        );
-    }
-
-    // Backing up the vault itself, or a folder inside the vault, is unsafe.
+    // Backing up the vault itself or a folder inside it is unsafe.
     if (isSameOrInside(sourceCanonical, vaultCanonical)) {
         return Result<BackupSummary>::failure(
             "The source folder cannot be the vault or a folder inside the vault."
         );
     }
 
-    // If the vault is inside the source, its subtree will be excluded below.
+    // If the vault is inside the source, its subtree is excluded.
     const bool vaultInsideSource =
         isSameOrInside(vaultCanonical, sourceCanonical);
 
@@ -143,7 +169,34 @@ Result<BackupSummary> BackupEngine::createBackup(
     BackupSummary summary;
     summary.warnings = m_scanner.warnings();
 
-    // Build the ordered list of nodes using the scanner's DFS traversal.
+    // An unreadable directory outside the excluded vault means the scan
+    // is incomplete. Never create a successful snapshot in that situation.
+    const QString unreadablePrefix =
+        QStringLiteral("Cannot read folder, left empty: ");
+
+    for (const QString &warning : m_scanner.warnings()) {
+        if (!warning.startsWith(unreadablePrefix))
+            continue;
+
+        const QString unreadablePath =
+            warning.mid(unreadablePrefix.size());
+
+        const QString unreadableCanonical =
+            normalizedPath(unreadablePath);
+
+        // If the path disappeared, fail closed. If it is inside the vault,
+        // it is excluded from this backup and does not affect completeness.
+        if (unreadableCanonical.isEmpty() ||
+            !vaultInsideSource ||
+            !isSameOrInside(unreadableCanonical, vaultCanonical)) {
+            return Result<BackupSummary>::failure(
+                "Backup cannot continue because a source directory "
+                "could not be read: " + unreadablePath
+            );
+        }
+    }
+
+    // Build the ordered list of nodes using DFS.
     std::vector<const FileNode *> orderedNodes;
     std::vector<const FileNode *> stack;
     stack.push_back(&scanResult.value());
@@ -152,24 +205,48 @@ Result<BackupSummary> BackupEngine::createBackup(
         const FileNode *current = stack.back();
         stack.pop_back();
 
+        const QString lexicalPath =
+            QDir::cleanPath(QFileInfo(current->path()).absoluteFilePath());
+
+        // Exclude the vault before resolving its children.
+        if (vaultInsideSource &&
+            isSameOrInside(lexicalPath, vaultCanonical)) {
+            continue;
+        }
+
+        QFileInfo lexicalInfo(current->path());
+
+        // The scanner normally skips symlinks. If an entry was replaced
+        // with a symlink after scanning, fail instead of following it.
+        if (lexicalInfo.isSymLink()) {
+            return Result<BackupSummary>::failure(
+                "A source entry became a symbolic link during backup: " +
+                current->path()
+            );
+        }
+
         const QString currentPath = normalizedPath(current->path());
 
-        if (currentPath.isEmpty())
-            continue;
+        if (currentPath.isEmpty()) {
+            return Result<BackupSummary>::failure(
+                "A source entry disappeared or cannot be resolved: " +
+                current->path()
+            );
+        }
 
-        // Never back up the vault directory or any of its contents.
-        if (vaultInsideSource &&
-            isSameOrInside(currentPath, vaultCanonical)) {
-            continue;
+        if (!isSameOrInside(currentPath, sourceCanonical)) {
+            return Result<BackupSummary>::failure(
+                "A source entry resolves outside the source directory: " +
+                current->path()
+            );
         }
 
         orderedNodes.push_back(current);
 
         const auto &children = current->children();
 
-        for (std::size_t i = children.size(); i > 0; --i) {
+        for (std::size_t i = children.size(); i > 0; --i)
             stack.push_back(&children[i - 1]);
-        }
     }
 
     Status transaction = m_database.beginTransaction();
@@ -181,10 +258,17 @@ Result<BackupSummary> BackupEngine::createBackup(
     }
 
     auto failBackup = [&](const QString &message) {
-        m_database.rollback();
+        const Status rollbackStatus = m_database.rollback();
 
-        // Discard cached state after rollback. SQLite is authoritative.
+        // SQLite is authoritative; discard cached state after rollback.
         m_index.clear();
+
+        if (!rollbackStatus.isOk()) {
+            return Result<BackupSummary>::failure(
+                message + " Database rollback also failed: " +
+                rollbackStatus.message()
+            );
+        }
 
         return Result<BackupSummary>::failure(message);
     };
@@ -199,11 +283,22 @@ Result<BackupSummary> BackupEngine::createBackup(
     summary.snapshotId = snapshotResult.value();
 
     for (const FileNode *node : orderedNodes) {
+        QFileInfo lexicalInfo(node->path());
+
+        if (lexicalInfo.isSymLink()) {
+            return failBackup(
+                "A source entry became a symbolic link during backup: " +
+                node->path()
+            );
+        }
+
         const QString path = normalizedPath(node->path());
 
-        if (path.isEmpty()) {
+        if (path.isEmpty() ||
+            !isSameOrInside(path, sourceCanonical)) {
             return failBackup(
-                "Cannot resolve an entry path: " + node->path()
+                "Source entry disappeared or resolved outside the source: " +
+                node->path()
             );
         }
 
@@ -212,7 +307,8 @@ Result<BackupSummary> BackupEngine::createBackup(
 
         if (relativePath.isEmpty() ||
             relativePath == ".." ||
-            relativePath.startsWith("../")) {
+            relativePath.startsWith("../") ||
+            relativePath.startsWith("..\\")) {
             return failBackup(
                 "Unsafe relative path encountered: " + path
             );
@@ -221,14 +317,15 @@ Result<BackupSummary> BackupEngine::createBackup(
         QFileInfo before(path);
 
         if (before.isSymLink()) {
-            summary.warnings.push_back(
-                "Skipped symbolic link: " + path
+            return failBackup(
+                "Source entry became a symbolic link during backup: " + path
             );
-            continue;
         }
 
         if (node->isDirectory()) {
-            if (!before.isDir() || !before.isReadable()) {
+            if (!before.exists() ||
+                !before.isDir() ||
+                !before.isReadable()) {
                 return failBackup(
                     "Directory became unavailable during backup: " + path
                 );
@@ -248,9 +345,17 @@ Result<BackupSummary> BackupEngine::createBackup(
             continue;
         }
 
-        if (!before.exists() || !before.isFile() || !before.isReadable()) {
+        if (!before.exists() ||
+            !before.isFile() ||
+            !before.isReadable()) {
             return failBackup(
                 "File is missing, unreadable, or not a regular file: " + path
+            );
+        }
+
+        if (before.size() < 0) {
+            return failBackup(
+                "File has an invalid size: " + path
             );
         }
 
@@ -292,7 +397,10 @@ Result<BackupSummary> BackupEngine::createBackup(
                     reinterpret_cast<const char *>(chunk.data());
 
                 fileHasher.addData(
-                    QByteArrayView(data, static_cast<qsizetype>(chunk.size()))
+                    QByteArrayView(
+                        data,
+                        static_cast<qsizetype>(chunk.size())
+                    )
                 );
 
                 const ChunkHash chunkHash =
@@ -301,8 +409,7 @@ Result<BackupSummary> BackupEngine::createBackup(
                 const QString hashHex =
                     ChunkIndex::toHex(chunkHash);
 
-                // store() verifies the content hash and safely reuses
-                // an already-existing valid physical chunk.
+                // store() validates the hash and safely reuses valid chunks.
                 auto stored = m_storage.store(hashHex, chunk);
 
                 if (!stored.isOk())
@@ -331,9 +438,15 @@ Result<BackupSummary> BackupEngine::createBackup(
             );
         }
 
+        // Re-check the original path as well as the resolved path.
+        QFileInfo lexicalAfter(node->path());
+        const QString resolvedAfter = normalizedPath(node->path());
         QFileInfo after(path);
 
-        if (!after.exists() ||
+        if (lexicalAfter.isSymLink() ||
+            resolvedAfter != path ||
+            !after.exists() ||
+            !after.isFile() ||
             after.size() != before.size() ||
             after.lastModified() != originalModified ||
             bytesRead != expectedSize) {
@@ -374,6 +487,13 @@ Result<BackupSummary> BackupEngine::createBackup(
                 return failBackup(linked.message());
         }
 
+        if (summary.originalBytes >
+            std::numeric_limits<std::uint64_t>::max() - bytesRead) {
+            return failBackup(
+                "Total backup size overflow."
+            );
+        }
+
         ++summary.filesBackedUp;
         summary.originalBytes += bytesRead;
     }
@@ -381,16 +501,22 @@ Result<BackupSummary> BackupEngine::createBackup(
     Status committed = m_database.commit();
 
     if (!committed.isOk()) {
-        m_database.rollback();
+        const Status rollbackStatus = m_database.rollback();
         m_index.clear();
 
-        return Result<BackupSummary>::failure(
+        QString message =
             "Backup transaction could not be committed: " +
-            committed.message()
-        );
+            committed.message();
+
+        if (!rollbackStatus.isOk()) {
+            message += " Database rollback also failed: " +
+                       rollbackStatus.message();
+        }
+
+        return Result<BackupSummary>::failure(message);
     }
 
-    // Any new DB rows are now committed. Clearing avoids stale cache state.
+    // Clear cache after commit; SQLite remains authoritative.
     m_index.clear();
 
     return Result<BackupSummary>::success(std::move(summary));
