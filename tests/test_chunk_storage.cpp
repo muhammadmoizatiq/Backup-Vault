@@ -1,6 +1,8 @@
+
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <iostream>
 
@@ -20,101 +22,209 @@ static void check(bool condition, const char *what)
 
 static QString hashOf(const Bytes &raw)
 {
-    QByteArray data(reinterpret_cast<const char *>(raw.data()), static_cast<int>(raw.size()));
-    return QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
+    QByteArray data(reinterpret_cast<const char *>(raw.data()),
+                    static_cast<int>(raw.size()));
+    return QString::fromLatin1(
+        QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex());
 }
 
 static Bytes makeBytes(std::size_t size)
 {
     Bytes raw(size);
     for (std::size_t i = 0; i < size; ++i)
-        raw[i] = static_cast<std::uint8_t>((i * 31 + 7) % 256);  // includes 0x00 bytes
+        raw[i] = static_cast<std::uint8_t>((i * 31 + 7) % 256);
     return raw;
 }
 
-static void overwrite(const QString &path, const QByteArray &data)
+static bool overwrite(const QString &path, const QByteArray &data)
 {
-    QFile f(path);
-    bool opened = f.open(QIODevice::WriteOnly | QIODevice::Truncate);
-    check(opened, "test helper can open chunk file for writing");
-    f.write(data);
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    return file.write(data) == data.size() && file.flush();
 }
 
 int main()
 {
     QTemporaryDir dir;
     check(dir.isValid(), "temp dir created");
+    if (!dir.isValid())
+        return 1;
+
     ChunkStorage storage(dir.path());
 
-    // Round trip: full chunk, small chunk, empty chunk.
-    for (std::size_t size : {kChunkSize, std::size_t(1000), std::size_t(1), std::size_t(0)}) {
-        Bytes raw = makeBytes(size);
-        QString hash = hashOf(raw);
-        auto stored = storage.store(hash, raw);
+    // Round trip: full chunk, small chunk, one-byte chunk and empty chunk.
+    for (std::size_t size : {
+             kChunkSize, std::size_t(1000), std::size_t(1), std::size_t(0)}) {
+        const Bytes raw = makeBytes(size);
+        const QString hash = hashOf(raw);
+        const auto stored = storage.store(hash, raw);
+
         check(stored.isOk(), "store succeeds");
-        check(stored.isOk() && stored.value().storedSize == size + 14, "stored size = header + payload");
-        check(stored.isOk() && stored.value().storagePath == "chunks/" + hash, "storage path");
+        check(stored.isOk() && stored.value().storedSize == size + 14,
+              "stored size = header + payload");
+        check(stored.isOk() && stored.value().storagePath == "chunks/" + hash,
+              "storage path");
         check(storage.exists(hash), "exists after store");
-        auto loaded = storage.load(hash);
-        check(loaded.isOk() && loaded.value() == raw, "load returns the same bytes");
+
+        const auto loaded = storage.load(hash);
+        check(loaded.isOk() && loaded.value() == raw,
+              "load returns the same bytes");
     }
 
     // Storing the same chunk twice is fine.
-    Bytes raw = makeBytes(5000);
-    QString hash = hashOf(raw);
+    const Bytes raw = makeBytes(5000);
+    const QString hash = hashOf(raw);
     check(storage.store(hash, raw).isOk(), "first store");
     check(storage.store(hash, raw).isOk(), "second store (duplicate)");
 
     // Bad input is rejected.
     check(!storage.store("abc", raw).isOk(), "short hash rejected");
-    check(!storage.store(hash.toUpper(), raw).isOk(), "uppercase hash rejected");
-    check(!storage.store(hashOf(makeBytes(10)), raw).isOk(), "hash/bytes mismatch rejected");
-    check(!storage.store(hashOf(makeBytes(kChunkSize + 1)), makeBytes(kChunkSize + 1)).isOk(), "oversized chunk rejected");
-    check(!storage.load("../../etc/passwd").isOk(), "path-like hash rejected");
+    check(!storage.store(hash.toUpper(), raw).isOk(),
+          "uppercase hash rejected");
+    check(!storage.store(hashOf(makeBytes(10)), raw).isOk(),
+          "hash/bytes mismatch rejected");
+    check(!storage.store(hashOf(makeBytes(kChunkSize + 1)),
+                         makeBytes(kChunkSize + 1)).isOk(),
+          "oversized chunk rejected");
+    check(!storage.load("../../etc/passwd").isOk(),
+          "path-like hash rejected");
 
     // Missing file.
-    check(!storage.load(hashOf(makeBytes(77))).isOk(), "missing chunk is an error");
-    check(!storage.exists(hashOf(makeBytes(77))), "exists is false for missing chunk");
+    const QString missingHash = hashOf(makeBytes(77));
+    check(!storage.load(missingHash).isOk(),
+          "missing chunk is an error");
+    check(!storage.exists(missingHash),
+          "exists is false for missing chunk");
 
-    // Corruption cases on the stored file.
-    QString path = QDir(dir.path()).filePath("chunks/" + hash);
-    QFile f(path);
-    check(f.open(QIODevice::ReadOnly), "test can open stored chunk file");
-    QByteArray good = f.readAll();
-    f.close();
+    const QString path = QDir(dir.path()).filePath("chunks/" + hash);
+    QFile file(path);
+    check(file.open(QIODevice::ReadOnly),
+          "test can open stored chunk file");
+    const QByteArray good = file.readAll();
+    file.close();
 
-    overwrite(path, good.left(5));
-    check(!storage.load(hash).isOk(), "truncated header detected");
+    check(overwrite(path, good.left(5)),
+          "write truncated-header fixture");
+    check(!storage.load(hash).isOk(),
+          "truncated header detected");
 
-    overwrite(path, good.left(good.size() - 10));
-    check(!storage.load(hash).isOk(), "truncated payload detected");
+    check(overwrite(path, good.left(good.size() - 10)),
+          "write truncated-payload fixture");
+    check(!storage.load(hash).isOk(),
+          "truncated payload detected");
 
     QByteArray badMagic = good;
     badMagic[0] = 'X';
-    overwrite(path, badMagic);
+    check(overwrite(path, badMagic), "write bad-magic fixture");
     check(!storage.load(hash).isOk(), "bad magic detected");
 
     QByteArray badVersion = good;
     badVersion[4] = 9;
-    overwrite(path, badVersion);
+    check(overwrite(path, badVersion), "write bad-version fixture");
     check(!storage.load(hash).isOk(), "unknown version detected");
 
     QByteArray badMethod = good;
     badMethod[5] = 7;
-    overwrite(path, badMethod);
+    check(overwrite(path, badMethod), "write bad-method fixture");
     check(!storage.load(hash).isOk(), "unknown method detected");
 
     QByteArray flipped = good;
     flipped[20] = static_cast<char>(flipped[20] ^ 0x01);
-    overwrite(path, flipped);
-    check(!storage.load(hash).isOk(), "flipped byte detected by hash check");
+    check(overwrite(path, flipped), "write hash-mismatch fixture");
+    check(!storage.load(hash).isOk(),
+          "flipped byte detected by hash check");
+
+    // A file one byte beyond the raw maximum must be rejected before
+    // readAll/allocation.
+    const QByteArray oversized(
+        static_cast<int>(kChunkSize + 14 + 1), 'x');
+    check(overwrite(path, oversized), "write oversized fixture");
+    check(!storage.load(hash).isOk(),
+          "oversized stored chunk rejected");
 
     // A corrupt existing file is repaired by store().
-    check(storage.store(hash, raw).isOk(), "store repairs corrupt file");
-    auto repaired = storage.load(hash);
-    check(repaired.isOk() && repaired.value() == raw, "repaired chunk loads correctly");
+    check(storage.store(hash, raw).isOk(),
+          "store repairs corrupt file");
+    const auto repaired = storage.load(hash);
+    check(repaired.isOk() && repaired.value() == raw,
+          "repaired chunk loads correctly");
+
+    // A symlinked chunk file must not be followed. Some Windows
+    // configurations cannot create symlinks without additional privileges.
+    QTemporaryDir linkTargetDir;
+    check(linkTargetDir.isValid(), "symlink target temp dir created");
+
+    const QString targetPath =
+        QDir(linkTargetDir.path()).filePath("target");
+    check(overwrite(targetPath, good), "create symlink target");
+
+    const QString linkedFileHash = hashOf(makeBytes(123));
+    const QString linkPath =
+        QDir(dir.path()).filePath("chunks/" + linkedFileHash);
+
+    const bool fileLinkCreated = QFile::link(targetPath, linkPath);
+    if (fileLinkCreated && QFileInfo(linkPath).isSymLink()) {
+        check(!storage.load(linkedFileHash).isOk(),
+              "symlinked chunk file rejected");
+        check(!storage.store(linkedFileHash, makeBytes(123)).isOk(),
+              "store refuses symlinked chunk file");
+        check(!storage.exists(linkedFileHash),
+              "exists rejects symlinked chunk file");
+    } else {
+        std::cout
+            << "SKIP: filesystem does not support creating test file symlinks"
+            << std::endl;
+        if (QFile::exists(linkPath))
+            QFile::remove(linkPath);
+    }
+
+    // A symlinked chunks directory must not redirect storage outside the vault.
+    QTemporaryDir outsideDir;
+    check(outsideDir.isValid(), "external temp dir created");
+
+    const QString outsideChunks =
+        QDir(outsideDir.path()).filePath("chunks");
+    check(QDir().mkpath(outsideChunks),
+          "create external chunks directory");
+
+    // Put a real chunk in the external directory. This ensures the exists()
+    // check proves that it rejects the symlink, rather than merely reporting
+    // that the requested chunk is absent.
+    ChunkStorage outsideStorage(outsideDir.path());
+    check(outsideStorage.store(hash, raw).isOk(),
+          "create real chunk in external chunks directory");
+
+    const QString linkedVault =
+        QDir(dir.path()).filePath("linked-vault");
+    check(QDir().mkpath(linkedVault),
+          "create linked vault parent");
+
+    const QString linkedChunks =
+        QDir(linkedVault).filePath("chunks");
+
+    const bool directoryLinkCreated =
+        QFile::link(outsideChunks, linkedChunks);
+
+    if (directoryLinkCreated && QFileInfo(linkedChunks).isSymLink()) {
+        ChunkStorage linkedStorage(linkedVault);
+
+        check(!linkedStorage.load(hash).isOk(),
+              "symlinked chunks directory rejected by load");
+        check(!linkedStorage.store(hash, raw).isOk(),
+              "symlinked chunks directory rejected by store");
+        check(!linkedStorage.exists(hash),
+              "exists rejects symlinked chunks directory");
+    } else {
+        std::cout
+            << "SKIP: filesystem does not support creating test directory symlinks"
+            << std::endl;
+        if (QFileInfo(linkedChunks).isSymLink())
+            QFile::remove(linkedChunks);
+    }
 
     if (failures == 0)
         std::cout << "All ChunkStorage checks passed." << std::endl;
+
     return failures == 0 ? 0 : 1;
 }
