@@ -11,6 +11,7 @@
 #include <QVariant>
 
 #include <limits>
+#include <utility>
 
 namespace bv {
 
@@ -559,6 +560,184 @@ Result<ChunkRecord> DatabaseManager::getChunk(
     record.createdAt = query.value(5).toString();
 
     return Result<ChunkRecord>::success(record);
+}
+
+Result<SnapshotRecord> DatabaseManager::getSnapshot(
+    std::int64_t snapshotId
+) const
+{
+    if (snapshotId <= 0) {
+        return Result<SnapshotRecord>::failure("Invalid snapshot ID.");
+    }
+
+    if (!isOpen()) {
+        return Result<SnapshotRecord>::failure("Database is not open.");
+    }
+
+    QSqlQuery query(database());
+    query.prepare(
+        "SELECT id, name, status FROM snapshots WHERE id = ?"
+    );
+    query.addBindValue(static_cast<qlonglong>(snapshotId));
+
+    if (!query.exec()) {
+        return Result<SnapshotRecord>::failure(
+            "Cannot retrieve snapshot: " + query.lastError().text()
+        );
+    }
+
+    if (!query.next()) {
+        return Result<SnapshotRecord>::failure("Snapshot does not exist.");
+    }
+
+    SnapshotRecord snapshot;
+    snapshot.id = query.value(0).toLongLong();
+    snapshot.name = query.value(1).toString();
+    snapshot.status = query.value(2).toString();
+
+    if (snapshot.status != QStringLiteral("complete")) {
+        return Result<SnapshotRecord>::failure(
+            "Snapshot is not complete and cannot be restored."
+        );
+    }
+
+    return Result<SnapshotRecord>::success(snapshot);
+}
+
+Result<std::vector<FileEntryRecord>> DatabaseManager::getSnapshotFiles(
+    std::int64_t snapshotId
+) const
+{
+    if (snapshotId <= 0) {
+        return Result<std::vector<FileEntryRecord>>::failure(
+            "Invalid snapshot ID."
+        );
+    }
+
+    if (!isOpen()) {
+        return Result<std::vector<FileEntryRecord>>::failure(
+            "Database is not open."
+        );
+    }
+
+    // Do not expose entries from missing or incomplete snapshots.
+    auto snapshot = getSnapshot(snapshotId);
+    if (!snapshot.isOk()) {
+        return Result<std::vector<FileEntryRecord>>::failure(
+            snapshot.message()
+        );
+    }
+
+    QSqlQuery query(database());
+    query.prepare(
+        "SELECT id, snapshot_id, relative_path, entry_type, file_size, content_hash "
+        "FROM files WHERE snapshot_id = ? ORDER BY relative_path COLLATE BINARY"
+    );
+    query.addBindValue(static_cast<qlonglong>(snapshotId));
+
+    if (!query.exec()) {
+        return Result<std::vector<FileEntryRecord>>::failure(
+            "Cannot retrieve snapshot file entries: " + query.lastError().text()
+        );
+    }
+
+    std::vector<FileEntryRecord> entries;
+    while (query.next()) {
+        FileEntryRecord entry;
+        entry.id = query.value(0).toLongLong();
+        entry.snapshotId = query.value(1).toLongLong();
+        entry.relativePath = query.value(2).toString();
+        entry.entryType = query.value(3).toString();
+        bool fileSizeOk = false;
+        const qlonglong storedFileSize = query.value(4).toLongLong(&fileSizeOk);
+        entry.contentHash = query.value(5).toString();
+
+        if (entry.id <= 0 || entry.snapshotId != snapshotId ||
+            !fileSizeOk || storedFileSize < 0 ||
+            entry.relativePath.isEmpty() ||
+            (entry.entryType != QStringLiteral("file") &&
+             entry.entryType != QStringLiteral("directory"))) {
+            return Result<std::vector<FileEntryRecord>>::failure(
+                "Snapshot contains invalid file metadata."
+            );
+        }
+        entry.fileSize = static_cast<std::uint64_t>(storedFileSize);
+
+        QString checkedPath = entry.relativePath;
+        if (!normalizeSafeRelativePath(checkedPath) ||
+            checkedPath != entry.relativePath) {
+            return Result<std::vector<FileEntryRecord>>::failure(
+                "Snapshot contains an unsafe relative path."
+            );
+        }
+
+        if (entry.entryType == QStringLiteral("directory")) {
+            if (entry.fileSize != 0 || !entry.contentHash.isEmpty()) {
+                return Result<std::vector<FileEntryRecord>>::failure(
+                    "Snapshot contains invalid directory metadata."
+                );
+            }
+        } else if (!isValidHash(entry.contentHash)) {
+            return Result<std::vector<FileEntryRecord>>::failure(
+                "Snapshot contains an invalid file content hash."
+            );
+        }
+
+        entries.push_back(std::move(entry));
+    }
+
+    return Result<std::vector<FileEntryRecord>>::success(std::move(entries));
+}
+
+Result<std::vector<QString>> DatabaseManager::getFileChunkHashes(
+    std::int64_t fileId
+) const
+{
+    if (fileId <= 0) {
+        return Result<std::vector<QString>>::failure("Invalid file ID.");
+    }
+
+    if (!isOpen()) {
+        return Result<std::vector<QString>>::failure("Database is not open.");
+    }
+
+    QSqlQuery query(database());
+    query.prepare(
+        "SELECT chunk_index, chunk_hash FROM file_chunks "
+        "WHERE file_id = ? ORDER BY chunk_index ASC"
+    );
+    query.addBindValue(static_cast<qlonglong>(fileId));
+
+    if (!query.exec()) {
+        return Result<std::vector<QString>>::failure(
+            "Cannot retrieve file chunk order: " + query.lastError().text()
+        );
+    }
+
+    std::vector<QString> hashes;
+    int expectedIndex = 0;
+
+    while (query.next()) {
+        bool indexOk = false;
+        const qlonglong actualIndex = query.value(0).toLongLong(&indexOk);
+        const QString hash = query.value(1).toString();
+
+        if (!indexOk || actualIndex != expectedIndex || !isValidHash(hash)) {
+            return Result<std::vector<QString>>::failure(
+                "File has invalid or non-contiguous chunk ordering."
+            );
+        }
+
+        hashes.push_back(hash);
+        if (expectedIndex == std::numeric_limits<int>::max()) {
+            return Result<std::vector<QString>>::failure(
+                "File contains too many chunk references."
+            );
+        }
+        ++expectedIndex;
+    }
+
+    return Result<std::vector<QString>>::success(std::move(hashes));
 }
 
 Status DatabaseManager::addFileChunk(

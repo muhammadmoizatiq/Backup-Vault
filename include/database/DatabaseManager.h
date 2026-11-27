@@ -3,6 +3,8 @@
 #include <QSqlDatabase>
 #include <QString>
 
+#include <vector>
+
 #include "common/Result.h"
 #include "common/Types.h"
 #include "storage/ChunkStorage.h"
@@ -17,6 +19,23 @@ struct ChunkRecord {
     QString storagePath;           // relative to the vault root
     std::int64_t refCount = 0;     // number of file_chunks rows using this chunk
     QString createdAt;             // UTC, ISO 8601
+};
+
+// Snapshot metadata read by the restore engine.
+struct SnapshotRecord {
+    std::int64_t id = 0;
+    QString name;
+    QString status;
+};
+
+// One file or directory stored in a snapshot.
+struct FileEntryRecord {
+    std::int64_t id = 0;
+    std::int64_t snapshotId = 0;
+    QString relativePath;
+    QString entryType;
+    std::uint64_t fileSize = 0;
+    QString contentHash;
 };
 
 // Owns one SQLite connection (Qt SQL, QSQLITE) to <vaultRoot>/storage/backups/vault.db.
@@ -76,6 +95,19 @@ public:
 
     // Fails if the chunk is not in the database.
     Result<ChunkRecord> getChunk(const QString &hashHex) const;
+
+    // Read-only snapshot access for restore operations. Only complete snapshots
+    // are returned. File entries are ordered by relative path for stable output.
+    Result<SnapshotRecord> getSnapshot(std::int64_t snapshotId) const;
+    Result<std::vector<FileEntryRecord>> getSnapshotFiles(
+        std::int64_t snapshotId
+    ) const;
+
+    // Returns hashes in their original file order (chunk_index 0..N-1).
+    // A gap or invalid hash is treated as corrupt snapshot metadata.
+    Result<std::vector<QString>> getFileChunkHashes(
+        std::int64_t fileId
+    ) const;
 
     // Links a chunk to a file at position chunkIndex and adds 1 to its
     // ref_count. Fails (and changes nothing) if the file or chunk does not
