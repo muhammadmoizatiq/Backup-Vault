@@ -43,6 +43,24 @@ public:
     bool isOpen() const;
     QString databasePath() const;
 
+    // Creates a snapshot row. profileId is optional.
+    // The caller should create it inside a transaction.
+    Result<std::int64_t> createSnapshot(
+        const QString &name,
+        bool hasProfileId = false,
+        std::int64_t profileId = 0
+    );
+
+    // Inserts a file or directory entry and returns its generated ID.
+    // entryType must be "file" or "directory".
+    Result<std::int64_t> addFileEntry(
+        std::int64_t snapshotId,
+        const QString &relativePath,
+        const QString &entryType,
+        std::uint64_t fileSize,
+        const QString &contentHash = QString()
+    );
+
     // For callers (e.g. the snapshot code) that must group many changes into
     // one transaction. addFileChunk() and removeFileChunks() work both inside
     // and outside such a transaction.
