@@ -165,7 +165,8 @@ void rollbackSavepoint(QSqlDatabase &db)
 } // namespace
 
 DatabaseManager::DatabaseManager(const QString &vaultRoot)
-    : m_vaultRoot(vaultRoot)
+    : m_vaultRoot(vaultRoot),
+      m_ownerThread(QThread::currentThread())
 {
 }
 
@@ -188,11 +189,18 @@ QSqlDatabase DatabaseManager::database() const
 
 bool DatabaseManager::isOpen() const
 {
-    return !m_connectionName.isEmpty() && database().isOpen();
+    return QThread::currentThread() == m_ownerThread &&
+           !m_connectionName.isEmpty() && database().isOpen();
 }
 
 Status DatabaseManager::open()
 {
+    if (QThread::currentThread() != m_ownerThread) {
+        return Status::failure(
+            "DatabaseManager must be opened and used on the thread where it was constructed."
+        );
+    }
+
     if (isOpen())
         return Status::success();
 
@@ -310,6 +318,9 @@ Status DatabaseManager::createSchemaIfNeeded(QSqlDatabase &db)
 
 void DatabaseManager::close()
 {
+    if (QThread::currentThread() != m_ownerThread)
+        return;
+
     if (m_connectionName.isEmpty())
         return;
 

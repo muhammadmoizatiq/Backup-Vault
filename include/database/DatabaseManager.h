@@ -2,6 +2,7 @@
 
 #include <QSqlDatabase>
 #include <QString>
+#include <QThread>
 
 #include <vector>
 
@@ -45,8 +46,9 @@ struct FileEntryRecord {
 // addFileChunk() and removeFileChunks() are the only functions that change
 // `ref_count`, and each changes the row and the counter together or not at all.
 //
-// A DatabaseManager must be used only in the thread that created it
-// (one connection per thread, see docs/Architecture.md section 10).
+// A DatabaseManager must be constructed, opened, used, closed, and destroyed
+// in the same thread. Cross-thread open/use is rejected (see
+// docs/Architecture.md section 10).
 class DatabaseManager {
 public:
     explicit DatabaseManager(const QString &vaultRoot);
@@ -126,6 +128,7 @@ private:
     QSqlDatabase database() const;
 
     QString m_vaultRoot;
+    QThread *m_ownerThread = nullptr;
     QString m_connectionName;  // empty while closed
 };
 
