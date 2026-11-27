@@ -1,48 +1,42 @@
-
 #include "core/Chunker.h"
 
 #include <QFile>
-#include <QByteArray>
 
 #include <utility>
 
 namespace bv {
 
-Result<std::vector<Bytes>> Chunker::splitFile(
-    const QString& filePath
+Status Chunker::streamFile(
+    const QString &filePath,
+    const ChunkCallback &callback
 ) {
+    if (!callback)
+        return Status::failure("Chunk callback is empty.");
+
     QFile file(filePath);
 
     if (!file.open(QIODevice::ReadOnly)) {
-        return Result<std::vector<Bytes>>::failure(
+        return Status::failure(
             QString("Could not open file: %1").arg(file.errorString())
         );
     }
 
-    std::vector<Bytes> chunks;
-
-    while (!file.atEnd()) {
-
-        QByteArray data = file.read(
-            static_cast<qint64>(kChunkSize)
-        );
+    while (true) {
+        QByteArray data = file.read(static_cast<qint64>(kChunkSize));
 
         if (data.isEmpty()) {
-
             if (file.error() != QFileDevice::NoError) {
-                return Result<std::vector<Bytes>>::failure(
-                    QString("Error reading file: %1")
-                        .arg(file.errorString())
+                return Status::failure(
+                    QString("Error reading file: %1").arg(file.errorString())
                 );
             }
 
-            if (!file.atEnd()) {
-                return Result<std::vector<Bytes>>::failure(
-                    "File reading stopped unexpectedly."
-                );
-            }
+            if (file.atEnd())
+                break;
 
-            break;
+            return Status::failure(
+                "File reading stopped unexpectedly."
+            );
         }
 
         Bytes chunk;
@@ -56,8 +50,30 @@ Result<std::vector<Bytes>> Chunker::splitFile(
             );
         }
 
-        chunks.push_back(std::move(chunk));
+        Status callbackStatus = callback(chunk);
+
+        if (!callbackStatus.isOk())
+            return callbackStatus;
     }
+
+    return Status::success();
+}
+
+Result<std::vector<Bytes>> Chunker::splitFile(
+    const QString &filePath
+) {
+    std::vector<Bytes> chunks;
+
+    Status status = streamFile(
+        filePath,
+        [&chunks](const Bytes &chunk) {
+            chunks.push_back(chunk);
+            return Status::success();
+        }
+    );
+
+    if (!status.isOk())
+        return Result<std::vector<Bytes>>::failure(status.message());
 
     return Result<std::vector<Bytes>>::success(std::move(chunks));
 }
