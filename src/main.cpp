@@ -1,14 +1,16 @@
+
 #include <QApplication>
-#include "gui/FileSelectionWidget.h"
+#include "gui/MainWindow.h"
 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
 
-    bv::FileSelectionWidget widget;
-    widget.resize(700, 400);
-    widget.setWindowTitle("BackupVault - File Selection");
-    widget.show();
+    app.setOrganizationName("Bro Code");
+    app.setApplicationName("BackupVault");
+
+    bv::MainWindow window;
+    window.show();
 
     return app.exec();
 }
