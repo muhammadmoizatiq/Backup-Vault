@@ -1,9 +1,8 @@
-
 #ifndef FILESELECTIONWIDGET_H
 #define FILESELECTIONWIDGET_H
 
-#include <QWidget>
 #include <QStringList>
+#include <QWidget>
 
 class QListWidget;
 class QPushButton;
@@ -19,13 +18,14 @@ public:
 
     QStringList selectedPaths() const;
 
-private slots:
-    void addFolder();
-    void addFiles();
-    void removeSelected();
+signals:
+    void pathsChanged();
 
 private:
+    void addFolder();
+    void addFiles();
     void addPath(const QString &path);
+    void removeSelected();
 
     QListWidget *pathList;
     QPushButton *addFolderButton;
