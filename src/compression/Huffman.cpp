@@ -1,158 +1,20 @@
 #include "compression/Huffman.h"
 
 #include <array>
-#include <utility>
 #include <vector>
+
+#include "compression/HuffmanTree.h"
 
 namespace bv {
 
 namespace {
 
-constexpr int kSymbolCount = 256;     // one symbol per byte value
-constexpr int kTableSize = 256;       // one length byte per symbol
-constexpr int kMaxCodeLength = 32;    // codes are kept in 32-bit integers
-constexpr int kNoNode = -1;
-constexpr int kNotASymbol = -1;
+constexpr int kSymbolCount = kHuffmanSymbolCount;
+constexpr int kTableSize = 256;  // one length byte per symbol
+constexpr int kMaxCodeLength = kHuffmanMaxCodeLength;
 
-using LengthTable = std::array<std::uint8_t, kSymbolCount>;
+using LengthTable = HuffmanLengths;
 using CodeTable = std::array<std::uint32_t, kSymbolCount>;
-
-// One node of a Huffman tree. Nodes live in a std::vector and refer to
-// each other by index, so no raw pointers or manual delete are needed.
-// A leaf has a symbol (0..255); an inner node has symbol == kNotASymbol.
-struct TreeNode {
-    std::uint64_t frequency;
-    int left;
-    int right;
-    int symbol;
-};
-
-// Min Heap of node indices, written by hand (std::priority_queue is not
-// allowed here). The node with the smallest frequency is at the top.
-// Equal frequencies are ordered by node index so the tree, and therefore
-// the encoded output, is the same on every run and platform.
-class MinHeap {
-public:
-    explicit MinHeap(const std::vector<TreeNode> &nodes) : m_nodes(nodes) {}
-
-    bool isEmpty() const { return m_items.empty(); }
-    std::size_t size() const { return m_items.size(); }
-
-    void push(int nodeIndex)
-    {
-        m_items.push_back(nodeIndex);
-        moveUp(m_items.size() - 1);
-    }
-
-    // Removes and returns the smallest node index. Heap must not be empty.
-    int pop()
-    {
-        const int smallest = m_items.front();
-        m_items.front() = m_items.back();
-        m_items.pop_back();
-        if (!m_items.empty())
-            moveDown(0);
-        return smallest;
-    }
-
-private:
-    bool isSmaller(int a, int b) const
-    {
-        if (m_nodes[a].frequency != m_nodes[b].frequency)
-            return m_nodes[a].frequency < m_nodes[b].frequency;
-        return a < b;
-    }
-
-    void moveUp(std::size_t i)
-    {
-        while (i > 0) {
-            const std::size_t parent = (i - 1) / 2;
-            if (!isSmaller(m_items[i], m_items[parent]))
-                break;
-            std::swap(m_items[i], m_items[parent]);
-            i = parent;
-        }
-    }
-
-    void moveDown(std::size_t i)
-    {
-        while (true) {
-            const std::size_t left = 2 * i + 1;
-            const std::size_t right = 2 * i + 2;
-            std::size_t smallest = i;
-            if (left < m_items.size() && isSmaller(m_items[left], m_items[smallest]))
-                smallest = left;
-            if (right < m_items.size() && isSmaller(m_items[right], m_items[smallest]))
-                smallest = right;
-            if (smallest == i)
-                break;
-            std::swap(m_items[i], m_items[smallest]);
-            i = smallest;
-        }
-    }
-
-    const std::vector<TreeNode> &m_nodes;
-    std::vector<int> m_items;
-};
-
-// Builds the Huffman tree for the given frequencies and writes each used
-// symbol's depth (its code length) into `lengths`.
-// Returns false if some code would be longer than kMaxCodeLength.
-bool computeCodeLengths(const std::array<std::uint64_t, kSymbolCount> &frequency,
-                        LengthTable &lengths)
-{
-    lengths.fill(0);
-
-    std::vector<TreeNode> nodes;
-    nodes.reserve(2 * kSymbolCount);
-    MinHeap heap(nodes);
-
-    for (int symbol = 0; symbol < kSymbolCount; ++symbol) {
-        if (frequency[symbol] == 0)
-            continue;
-        nodes.push_back({frequency[symbol], kNoNode, kNoNode, symbol});
-        heap.push(static_cast<int>(nodes.size()) - 1);
-    }
-
-    // No symbols at all (empty input): there is nothing to build.
-    if (heap.isEmpty())
-        return true;
-
-    // One distinct symbol: the tree is a single leaf. Give it a 1-bit code
-    // so that every input byte still produces at least one bit.
-    if (heap.size() == 1) {
-        lengths[nodes[0].symbol] = 1;
-        return true;
-    }
-
-    // Repeatedly join the two least frequent nodes.
-    while (heap.size() > 1) {
-        const int first = heap.pop();
-        const int second = heap.pop();
-        nodes.push_back({nodes[first].frequency + nodes[second].frequency,
-                         first, second, kNotASymbol});
-        heap.push(static_cast<int>(nodes.size()) - 1);
-    }
-    const int root = heap.pop();
-
-    // Walk the tree; a leaf's depth is its code length.
-    std::vector<std::pair<int, int>> pending;  // (node index, depth)
-    pending.push_back({root, 0});
-    while (!pending.empty()) {
-        const std::pair<int, int> current = pending.back();
-        pending.pop_back();
-        const TreeNode &node = nodes[current.first];
-        if (node.symbol != kNotASymbol) {
-            if (current.second > kMaxCodeLength)
-                return false;
-            lengths[node.symbol] = static_cast<std::uint8_t>(current.second);
-        } else {
-            pending.push_back({node.left, current.second + 1});
-            pending.push_back({node.right, current.second + 1});
-        }
-    }
-    return true;
-}
 
 // Canonical code assignment. Shorter codes come first; codes of equal
 // length are handed out in byte-value order. Encoder and decoder both use
@@ -214,41 +76,17 @@ Status tableIsValid(const LengthTable &lengths, int &usedSymbols)
     return Status::success();
 }
 
-// Builds a decoding tree from canonical codes: bit 0 goes left, bit 1 goes
-// right. Returns false if the codes do not form a proper prefix code.
+// Builds the decoding tree from canonical codes. Returns false if the
+// codes do not form a proper prefix code.
 bool buildDecodingTree(const LengthTable &lengths, const CodeTable &codes,
-                       std::vector<TreeNode> &tree)
+                       HuffmanTree &tree)
 {
     tree.clear();
-    tree.push_back({0, kNoNode, kNoNode, kNotASymbol});  // root
-
     for (int symbol = 0; symbol < kSymbolCount; ++symbol) {
-        const int length = lengths[symbol];
-        if (length == 0)
+        if (lengths[symbol] == 0)
             continue;
-
-        int current = 0;
-        for (int bitIndex = length - 1; bitIndex >= 0; --bitIndex) {
-            if (tree[current].symbol != kNotASymbol)
-                return false;  // an earlier code is a prefix of this one
-            const bool goRight = ((codes[symbol] >> bitIndex) & 1) != 0;
-            int child = goRight ? tree[current].right : tree[current].left;
-            if (child == kNoNode) {
-                tree.push_back({0, kNoNode, kNoNode, kNotASymbol});
-                child = static_cast<int>(tree.size()) - 1;
-                if (goRight)
-                    tree[current].right = child;
-                else
-                    tree[current].left = child;
-            }
-            current = child;
-        }
-        // The final node must be new and must not have children.
-        if (tree[current].symbol != kNotASymbol || tree[current].left != kNoNode
-            || tree[current].right != kNoNode) {
+        if (!tree.addCode(symbol, codes[symbol], lengths[symbol]))
             return false;
-        }
-        tree[current].symbol = symbol;
     }
     return true;
 }
@@ -261,8 +99,11 @@ Result<Bytes> Huffman::encode(const Bytes &input)
     for (std::uint8_t value : input)
         ++frequency[value];
 
+    HuffmanTree tree;
+    tree.buildFromFrequencies(frequency);
+
     LengthTable lengths;
-    if (!computeCodeLengths(frequency, lengths))
+    if (!tree.codeLengths(lengths, kMaxCodeLength))
         return Result<Bytes>::failure("Huffman code would be longer than 32 bits.");
 
     CodeTable codes;
@@ -326,14 +167,14 @@ Result<Bytes> Huffman::decode(const Bytes &encoded, std::size_t originalSize)
     CodeTable codes;
     assignCanonicalCodes(lengths, codes);
 
-    std::vector<TreeNode> tree;
+    HuffmanTree tree;
     if (!buildDecodingTree(lengths, codes, tree))
         return Result<Bytes>::failure("Huffman table is not a valid prefix code.");
 
     Bytes output;
     output.reserve(originalSize);
     std::uint64_t bitPosition = 0;
-    int current = 0;  // start at the root
+    int current = tree.root();
     while (output.size() < originalSize) {
         if (bitPosition >= totalBits)
             return Result<Bytes>::failure("Huffman data is truncated (ran out of bits).");
@@ -342,13 +183,13 @@ Result<Bytes> Huffman::decode(const Bytes &encoded, std::size_t originalSize)
         const bool goRight = ((byte >> (7 - bitPosition % 8)) & 1) != 0;
         ++bitPosition;
 
-        const int next = goRight ? tree[current].right : tree[current].left;
+        const int next = tree.child(current, goRight);
         if (next == kNoNode)
             return Result<Bytes>::failure("Huffman data contains an invalid code.");
 
-        if (tree[next].symbol != kNotASymbol) {
-            output.push_back(static_cast<std::uint8_t>(tree[next].symbol));
-            current = 0;
+        if (tree.isLeaf(next)) {
+            output.push_back(static_cast<std::uint8_t>(tree.symbolAt(next)));
+            current = tree.root();
         } else {
             current = next;
         }
