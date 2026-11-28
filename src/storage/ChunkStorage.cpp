@@ -6,6 +6,8 @@
 #include <QFileInfo>
 #include <QSaveFile>
 
+#include "compression/Huffman.h"
+
 namespace bv {
 
 namespace {
@@ -119,14 +121,25 @@ Result<StoredChunk> ChunkStorage::store(const QString &hashHex, const Bytes &raw
         return Result<StoredChunk>::success(info);
     }
 
-    // Huffman will be tried here once BV-09 exists. For now: raw only.
+    // Try Huffman first. It is used only if the whole stored chunk
+    // (header + payload) ends up smaller than the raw version; otherwise
+    // (or if encoding fails) the raw bytes are stored.
+    std::uint8_t method = kMethodRaw;
+    QByteArray payload = rawData;
+    const Result<Bytes> encoded = Huffman::encode(raw);
+    if (encoded.isOk() && encoded.value().size() < raw.size()) {
+        method = kMethodHuffman;
+        payload = QByteArray(reinterpret_cast<const char *>(encoded.value().data()),
+                             static_cast<int>(encoded.value().size()));
+    }
+
     QByteArray fileData;
     fileData.append(kMagic, 4);
     fileData.append(static_cast<char>(kFormatVersion));
-    fileData.append(static_cast<char>(kMethodRaw));
+    fileData.append(static_cast<char>(method));
     appendUint32(fileData, static_cast<std::uint32_t>(raw.size()));
-    appendUint32(fileData, static_cast<std::uint32_t>(raw.size()));
-    fileData.append(rawData);
+    appendUint32(fileData, static_cast<std::uint32_t>(payload.size()));
+    fileData.append(payload);
 
     if (!QDir().mkpath(directory))
         return Result<StoredChunk>::failure("Cannot create chunks folder: " + directory);
@@ -213,9 +226,15 @@ Result<Bytes> ChunkStorage::load(const QString &hashHex) const
             return Result<Bytes>::failure("Raw chunk payload size does not match original size.");
         rawData = payload;
     } else {
-        // Huffman decoding arrives with BV-09. Its maximum stored size
-        // must be revisited when that format is implemented.
-        return Result<Bytes>::failure("Huffman chunks are not supported yet (BV-09).");
+        // store() only writes Huffman when it is smaller than raw, so a
+        // valid Huffman file is never larger than the raw maximum checked
+        // above. Huffman::decode checks the table, truncation and padding.
+        const Bytes encodedPayload(payload.begin(), payload.end());
+        const Result<Bytes> decoded = Huffman::decode(encodedPayload, originalSize);
+        if (!decoded.isOk())
+            return Result<Bytes>::failure("Cannot decode Huffman chunk: " + decoded.message());
+        rawData = QByteArray(reinterpret_cast<const char *>(decoded.value().data()),
+                             static_cast<int>(decoded.value().size()));
     }
 
     if (sha256Hex(rawData) != hashHex)

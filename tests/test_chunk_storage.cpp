@@ -150,6 +150,90 @@ int main()
     check(repaired.isOk() && repaired.value() == raw,
           "repaired chunk loads correctly");
 
+    // Huffman chunks (BV-09): compressible data is stored with Huffman,
+    // incompressible data stays raw, and damaged Huffman files are rejected.
+    {
+        Bytes compressible(kChunkSize);
+        const char pattern[] = "aaaabbc ";
+        for (std::size_t i = 0; i < compressible.size(); ++i)
+            compressible[i] = static_cast<std::uint8_t>(pattern[i % 8]);
+        const QString compHash = hashOf(compressible);
+
+        const auto compStored = storage.store(compHash, compressible);
+        check(compStored.isOk(), "store compressible chunk");
+        check(compStored.isOk() && compStored.value().storedSize < kChunkSize / 2,
+              "compressible chunk is stored in much less space");
+
+        const QString compPath = QDir(dir.path()).filePath("chunks/" + compHash);
+        QFile compFile(compPath);
+        check(compFile.open(QIODevice::ReadOnly), "open Huffman chunk file");
+        const QByteArray compGood = compFile.readAll();
+        compFile.close();
+        check(compGood.size() > 14 && compGood[5] == 1,
+              "compressible chunk uses the Huffman method");
+        check(compStored.isOk()
+                  && static_cast<std::uint64_t>(compGood.size()) == compStored.value().storedSize,
+              "storedSize matches the file size");
+
+        const auto compLoaded = storage.load(compHash);
+        check(compLoaded.isOk() && compLoaded.value() == compressible,
+              "Huffman chunk loads back to the same bytes");
+        const auto compAgain = storage.store(compHash, compressible);
+        check(compAgain.isOk() && compStored.isOk()
+                  && compAgain.value().storedSize == compStored.value().storedSize,
+              "duplicate Huffman chunk is not rewritten");
+
+        // A full chunk of one repeated byte.
+        const Bytes zeros(kChunkSize, 0);
+        const QString zerosHash = hashOf(zeros);
+        check(storage.store(zerosHash, zeros).isOk(), "store all-zero chunk");
+        const auto zerosLoaded = storage.load(zerosHash);
+        check(zerosLoaded.isOk() && zerosLoaded.value() == zeros,
+              "all-zero chunk round trip");
+
+        // Random-looking data is not smaller with Huffman, so it stays raw.
+        const Bytes noise = makeBytes(kChunkSize);
+        const QString noiseHash = hashOf(noise);
+        check(storage.store(noiseHash, noise).isOk(), "store incompressible chunk");
+        QFile noiseFile(QDir(dir.path()).filePath("chunks/" + noiseHash));
+        check(noiseFile.open(QIODevice::ReadOnly), "open raw chunk file");
+        const QByteArray noiseData = noiseFile.readAll();
+        noiseFile.close();
+        check(noiseData.size() == static_cast<int>(kChunkSize) + 14 && noiseData[5] == 0,
+              "incompressible chunk falls back to raw");
+
+        // Damaged Huffman files.
+        QByteArray damaged = compGood;
+        damaged[14 + 256 + 5] = static_cast<char>(damaged[14 + 256 + 5] ^ 0x10);
+        check(overwrite(compPath, damaged), "write damaged Huffman bits");
+        check(!storage.load(compHash).isOk(), "damaged Huffman bit stream detected");
+
+        damaged = compGood;
+        damaged[14 + 97] = static_cast<char>(damaged[14 + 97] + 1);
+        check(overwrite(compPath, damaged), "write damaged Huffman table");
+        check(!storage.load(compHash).isOk(), "damaged Huffman table detected");
+
+        damaged = compGood;
+        damaged[6] = static_cast<char>(damaged[6] + 1);  // original size + 1
+        check(overwrite(compPath, damaged), "write wrong original size");
+        check(!storage.load(compHash).isOk(), "wrong original size detected");
+
+        damaged = compGood;
+        damaged[5] = 0;  // claims raw, but payload is Huffman data
+        check(overwrite(compPath, damaged), "write wrong method");
+        check(!storage.load(compHash).isOk(), "wrong method detected");
+
+        check(overwrite(compPath, compGood.left(compGood.size() - 3)),
+              "write truncated Huffman file");
+        check(!storage.load(compHash).isOk(), "truncated Huffman file detected");
+
+        // store() repairs a damaged Huffman file.
+        check(storage.store(compHash, compressible).isOk(), "store repairs Huffman file");
+        const auto compRepaired = storage.load(compHash);
+        check(compRepaired.isOk() && compRepaired.value() == compressible,
+              "repaired Huffman chunk loads");
+    }
+
     // A symlinked chunk file must not be followed. Some Windows
     // configurations cannot create symlinks without additional privileges.
     QTemporaryDir linkTargetDir;
