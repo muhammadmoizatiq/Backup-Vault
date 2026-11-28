@@ -536,6 +536,26 @@ void MainWindow::chooseVaultFolder()
         );
         return;
     }
+    // Ask for confirmation before changing the vault location.
+if (selectedPath != vaultSettings.vaultRoot()) {
+
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        "Change Vault Location?",
+        "Changing the vault location does not move your existing backup data.\n\n"
+        "Your current database and backup chunks will remain in:\n"
+        + vaultSettings.vaultRoot()
+        + "\n\nThe new location will be used as a separate vault. "
+          "Your existing snapshots will not automatically appear there.\n\n"
+          "Do you want to continue?",
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No
+    );
+
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
+}
 
     if (!vaultSettings.setVaultRoot(selectedPath)) {
         QMessageBox::critical(
